@@ -56,7 +56,7 @@ const iterativeProviderTpl = () => {
 terraform {
   required_providers {
     iterative = {
-      source = "iterative/iterative"
+      source = "github.com/dacbd/iterative"
     }
   }
 }
