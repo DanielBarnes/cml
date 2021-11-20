@@ -164,10 +164,17 @@ const runCloud = async (opts) => {
         awsSecurityGroup
       });
     }
-
+    //console.log(process);
     await fs.writeFile(tfMainPath, tpl);
+    winston.info('before TF init');
+    try {
     await tf.init({ dir: tfPath });
+    } catch (err) {
+      winston.error(err);
+    }
+    winston.info('before TF apply');
     await tf.apply({ dir: tfPath });
+    winston.info('after TF apply');
 
     const tfStatePath = join(tfPath, 'terraform.tfstate');
     const tfstate = await tf.loadTfState({ path: tfStatePath });

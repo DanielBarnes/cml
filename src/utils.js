@@ -11,9 +11,27 @@ const exec = async (command) => {
       command,
       { ...process.env },
       (error, stdout, stderr) => {
+        /*console.log(process.env);
+        console.log(command);
+        console.log('stdout to follow', typeof stdout);
+        console.log(stdout);
+        console.log(error);
+        console.log('stderr to follow', typeof stderr);
+        console.log(stderr);*/
+        if (!process.stdout.isTTY) {
+          const controlSequence = /(?<excape_char>\\u001b|\u001b)(?<csi_term_char>\[)(?<parameters>(\d*;?)+)(?<term_byte>m)/g;
+          stdout = stdout.replace(controlSequence, '');
+          stderr = stderr.replace(controlSequence, '');
+        }
         if (error) reject(new Error(`${command}\n\t${stdout}\n\t${stderr}`));
 
-        resolve((stdout || stderr).slice(0, -1));
+        resolve(
+          (stdout || stderr)
+            //.replace(/\x1B\[\d+m/g, '')
+            //.replace(/(?<excape_char>\\u001b)(?<csi_term_char>\[)(?<parameters>(\d*;?)+)(?<term_byte>m)/g, '')
+            .replace(/(\\u001b|\u001b)(\[)((\d*;?)+)(m)/g, '')
+            .slice(0, -1)
+        );
       }
     );
   });

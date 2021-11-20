@@ -8,6 +8,8 @@ const winston = require('winston');
 const yargs = require('yargs');
 
 const configureLogger = (level) => {
+  console.log("configure logger");
+  console.log(process.stdout.isTTY);
   winston.configure({
     format: process.stdout.isTTY
       ? winston.format.combine(
@@ -16,6 +18,7 @@ const configureLogger = (level) => {
         )
       : winston.format.combine(
           winston.format.errors({ stack: true }),
+          winston.format.uncolorize(),
           winston.format.json()
         ),
     transports: [
@@ -42,6 +45,8 @@ const runPlugin = async ({ $0: executable, command }) => {
 };
 
 const handleError = (message, error) => {
+  console.log('handleError');
+  console.log(error);
   if (error) {
     winston.error(error);
   } else {
