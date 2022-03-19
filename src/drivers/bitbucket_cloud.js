@@ -106,9 +106,19 @@ class BitbucketCloud {
     throw new Error('Bitbucket Cloud does not support runners!');
   }
 
+  async runnerById(opts = {}) {
+    throw new Error('Not yet implemented');
+  }
+
   async prCreate(opts = {}) {
     const { projectPath } = this;
-    const { source, target, title, description } = opts;
+    const { source, target, title, description, autoMerge } = opts;
+
+    if (autoMerge) {
+      throw new Error(
+        'Auto-merging is unsupported by Bitbucket Cloud. See https://jira.atlassian.com/browse/BCLOUD-14286'
+      );
+    }
 
     const body = JSON.stringify({
       title,
@@ -250,14 +260,14 @@ class BitbucketCloud {
     repo.username = user;
 
     const command = `
-    git config --unset user.name && \\
-    git config --unset user.email && \\
-    git config --unset push.default && \\
+    git config --unset user.name;
+    git config --unset user.email;
+    git config --unset push.default;
     git config --unset http.http://${this.repo
       .replace('https://', '')
-      .replace('.git', '')}.proxy && \\
-    git config user.name "${userName || this.userName}" && \\
-    git config user.email "${userEmail || this.userEmail}" && \\
+      .replace('.git', '')}.proxy;
+    git config user.name "${userName || this.userName}" &&
+    git config user.email "${userEmail || this.userEmail}" &&
     git remote set-url origin "${repo.toString()}${
       repo.toString().endsWith('.git') ? '' : '.git'
     }"`;
