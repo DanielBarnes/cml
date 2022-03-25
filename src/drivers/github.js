@@ -279,7 +279,7 @@ class Github {
       );
 
       return spawn(
-        (arch === 'linux-x64' ? 'systemd-run --pipe --same-dir ' : '') +
+        (arch === 'linux-x64' ? 'systemd-run --user --pipe --same-dir ' : '') +
           resolve(workdir, 'run.sh'),
         {
           shell: true
