@@ -244,6 +244,7 @@ class Github {
 
   async startRunner(opts) {
     const { workdir, single, name, labels } = opts;
+    const arch = process.platform === 'darwin' ? 'osx-x64' : 'linux-x64';
 
     try {
       const runnerCfg = resolve(workdir, '.runner');
@@ -251,7 +252,6 @@ class Github {
       try {
         await fs.unlink(runnerCfg);
       } catch (e) {
-        const arch = process.platform === 'darwin' ? 'osx-x64' : 'linux-x64';
         const { tag_name: ver } = await (
           await fetch(
             'https://api.github.com/repos/actions/runner/releases/latest'
@@ -278,10 +278,13 @@ class Github {
         )}" ${single ? ' --ephemeral' : ''}`
       );
 
-      return spawn(resolve(workdir, 'run.sh'), {
-        shell: true,
-        env: {}
-      });
+      return spawn(
+        (arch === 'linux-x64' ? 'systemd-run --pipe --same-dir ' : '') +
+          resolve(workdir, 'run.sh'),
+        {
+          shell: true
+        }
+      );
     } catch (err) {
       throw new Error(`Failed preparing GitHub runner: ${err.message}`);
     }
