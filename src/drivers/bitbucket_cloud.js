@@ -1,10 +1,15 @@
+const crypto = require('crypto');
 const fetch = require('node-fetch');
 const winston = require('winston');
 const { URL } = require('url');
+const FormData = require('form-data');
 const ProxyAgent = require('proxy-agent');
+
+const { fetchUploadData } = require('../utils');
 
 const { BITBUCKET_COMMIT, BITBUCKET_BRANCH, BITBUCKET_PIPELINE_UUID } =
   process.env;
+
 class BitbucketCloud {
   constructor(opts = {}) {
     const { repo, token } = opts;
@@ -87,7 +92,29 @@ class BitbucketCloud {
   }
 
   async upload(opts = {}) {
-    throw new Error('Bitbucket Cloud does not support upload!');
+    const { projectPath } = this;
+    const { size, mime, data } = await fetchUploadData(opts);
+
+    const chunks = [];
+    for await (const chunk of data) chunks.push(chunk);
+    const buffer = Buffer.concat(chunks);
+
+    const filename = `cml-${crypto
+      .createHash('sha256')
+      .update(buffer)
+      .digest('hex')}`;
+    const body = new FormData();
+    body.append('files', buffer, { filename });
+
+    const endpoint = `/repositories/${projectPath}/downloads`;
+    await this.request({ endpoint, method: 'POST', body });
+    return {
+      uri: `https://bitbucket.org/${decodeURIComponent(
+        projectPath
+      )}/downloads/${filename}`,
+      mime,
+      size
+    };
   }
 
   async runnerToken() {
@@ -114,12 +141,6 @@ class BitbucketCloud {
     const { projectPath } = this;
     const { source, target, title, description, autoMerge } = opts;
 
-    if (autoMerge) {
-      throw new Error(
-        'Auto-merging is unsupported by Bitbucket Cloud. See https://jira.atlassian.com/browse/BCLOUD-14286'
-      );
-    }
-
     const body = JSON.stringify({
       title,
       description,
@@ -136,6 +157,7 @@ class BitbucketCloud {
     });
     const endpoint = `/repositories/${projectPath}/pullrequests/`;
     const {
+      id,
       links: {
         html: { href }
       }
@@ -145,7 +167,32 @@ class BitbucketCloud {
       body
     });
 
+    if (autoMerge)
+      await this.prAutoMerge({ pullRequestId: id, mergeMode: autoMerge });
     return href;
+  }
+
+  async prAutoMerge({ pullRequestId, mergeMode, mergeMessage }) {
+    winston.warn(
+      'Auto-merge is unsupported by Bitbucket Cloud; see https://jira.atlassian.com/browse/BCLOUD-14286. Trying to merge immediately...'
+    );
+    const { projectPath } = this;
+    const endpoint = `/repositories/${projectPath}/pullrequests/${pullRequestId}/merge`;
+    const mergeModes = {
+      merge: 'merge_commit',
+      rebase: 'fast_forward',
+      squash: 'squash'
+    };
+    const body = JSON.stringify({
+      merge_strategy: mergeModes[mergeMode],
+      close_source_branch: true,
+      message: mergeMessage
+    });
+    await this.request({
+      method: 'POST',
+      endpoint,
+      body
+    });
   }
 
   async prCommentCreate(opts = {}) {
@@ -309,10 +356,10 @@ class BitbucketCloud {
 
     if (!(url || endpoint))
       throw new Error('Bitbucket Cloud API endpoint not found');
-    const headers = {
-      'Content-Type': 'application/json',
-      Authorization: 'Basic ' + `${token}`
-    };
+
+    const headers = { Authorization: `Basic ${token}` };
+    if (!body || body.constructor !== FormData)
+      headers['Content-Type'] = 'application/json';
 
     const requestUrl = url || `${api}${endpoint}`;
     winston.debug(`${method} ${requestUrl}`);
@@ -324,20 +371,23 @@ class BitbucketCloud {
       agent: new ProxyAgent()
     });
 
-    if (response.status > 300) {
-      try {
-        const json = await response.json();
-        winston.debug(json);
-        // Attempt to get additional context. We have observed two different error schemas
-        // from BitBucket API responses: `{"error": {"message": "Error message"}}` and
-        // `{"error": "Error message"}`.
-        throw new Error(json.error.message || json.error);
-      } catch (err) {
-        throw new Error(`${response.statusText} ${err.message}`);
-      }
+    const responseBody = response.headers.get('Content-Type').includes('json')
+      ? await response.json()
+      : await response.text();
+
+    if (!response.ok) {
+      // Attempt to get additional context. We have observed two different error schemas
+      // from BitBucket API responses: `{"error": {"message": "Error message"}}` and
+      // `{"error": "Error message"}`, apart from plain text responses like `Bad Request`.
+      const { error } = responseBody.error
+        ? responseBody
+        : { error: responseBody };
+      throw new Error(
+        `${response.statusText} ${error.message || error}`.trim()
+      );
     }
 
-    return await response.json();
+    return responseBody;
   }
 }
 
