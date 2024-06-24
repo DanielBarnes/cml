@@ -9,23 +9,24 @@ const { Octokit } = require('@octokit/rest');
 const { withCustomRequest } = require('@octokit/graphql');
 const { throttling } = require('@octokit/plugin-throttling');
 const tar = require('tar');
-const ProxyAgent = require('proxy-agent');
+const { ProxyAgent } = require('proxy-agent');
 
-const { download, exec } = require('../utils');
-const winston = require('winston');
+const { download, exec, sleep } = require('../utils');
+const { logger } = require('../logger');
 
 const CHECK_TITLE = 'CML Report';
 process.env.RUNNER_ALLOW_RUNASROOT = 1;
 
 const {
-  GITHUB_REPOSITORY,
-  GITHUB_SHA,
-  GITHUB_REF,
-  GITHUB_HEAD_REF,
-  GITHUB_EVENT_NAME,
-  GITHUB_RUN_ID,
-  GITHUB_TOKEN,
   CI,
+  GITHUB_EVENT_NAME,
+  GITHUB_HEAD_REF,
+  GITHUB_REF,
+  GITHUB_REPOSITORY,
+  GITHUB_RUN_ID,
+  GITHUB_SHA,
+  GITHUB_TOKEN,
+  GITHUB_WORKFLOW,
   TPI_TASK
 } = process.env;
 
@@ -49,28 +50,32 @@ const ownerRepo = (opts) => {
   return { owner, repo };
 };
 
-const octokit = (token, repo) => {
+const octokit = (token, repo, log) => {
   if (!token) throw new Error('token not found');
 
-  const throttleHandler = (retryAfter, options) => {
+  const throttleHandler = (reason, offset) => async (retryAfter, options) => {
     if (options.request.retryCount <= 5) {
-      winston.info(`Retrying after ${retryAfter} seconds!`);
+      logger.info(
+        `Retrying because of ${reason} in ${retryAfter + offset} seconds`
+      );
+      await new Promise((resolve) => setTimeout(resolve, offset * 1000));
       return true;
     }
   };
   const octokitOptions = {
     request: { agent: new ProxyAgent() },
     auth: token,
+    log,
     throttle: {
-      onRateLimit: throttleHandler,
-      onAbuseLimit: throttleHandler
+      onAbuseLimit: throttleHandler('abuse limit', 120), // deprecated, see onSecondaryRateLimit
+      onRateLimit: throttleHandler('rate limit', 30),
+      onSecondaryRateLimit: throttleHandler('secondary rate limit', 30)
     }
   };
-
-  if (!repo.includes('github.com')) {
+  const { host, hostname } = new url.URL(repo);
+  if (hostname !== 'github.com') {
     // GitHub Enterprise, use the: repo URL host + '/api/v3' - as baseURL
     // as per: https://developer.github.com/enterprise/v3/enterprise-admin/#endpoint-urls
-    const { host } = new url.URL(repo);
     octokitOptions.baseUrl = `https://${host}/api/v3`;
   }
 
@@ -94,7 +99,14 @@ class Github {
     return ownerRepo({ uri });
   }
 
-  async commentCreate(opts = {}) {
+  async user({ name: username } = {}) {
+    const { users } = octokit(this.token, this.repo);
+    const { data: user } = await users.getByUsername({ username });
+
+    return user;
+  }
+
+  async commitCommentCreate(opts = {}) {
     const { report: body, commitSha } = opts;
     const { repos } = octokit(this.token, this.repo);
 
@@ -107,7 +119,7 @@ class Github {
     ).data.html_url;
   }
 
-  async commentUpdate(opts = {}) {
+  async commitCommentUpdate(opts = {}) {
     const { report: body, id } = opts;
     const { repos } = octokit(this.token, this.repo);
 
@@ -172,9 +184,9 @@ class Github {
     const warning =
       'This command only works inside a Github runner or a Github app.';
 
-    if (!CI || TPI_TASK) winston.warn(warning);
+    if (!CI || TPI_TASK) logger.warn(warning);
     if (GITHUB_TOKEN && GITHUB_TOKEN !== this.token)
-      winston.warn(
+      logger.warn(
         `Your token is different than the GITHUB_TOKEN, this command does not work with PAT. ${warning}`
       );
 
@@ -197,7 +209,7 @@ class Github {
 
   async runnerToken() {
     const { owner, repo } = ownerRepo({ uri: this.repo });
-    const { actions } = octokit(this.token, this.repo);
+    const { actions } = octokit(this.token, this.repo, logger);
 
     if (typeof repo !== 'undefined') {
       const {
@@ -226,7 +238,7 @@ class Github {
   async unregisterRunner(opts) {
     const { runnerId } = opts;
     const { owner, repo } = ownerRepo({ uri: this.repo });
-    const { actions } = octokit(this.token, this.repo);
+    const { actions } = octokit(this.token, this.repo, logger);
 
     if (typeof repo !== 'undefined') {
       await actions.deleteSelfHostedRunnerFromRepo({
@@ -243,7 +255,11 @@ class Github {
   }
 
   async startRunner(opts) {
-    const { workdir, single, name, labels } = opts;
+    const { workdir, single, name, labels, env } = opts;
+
+    this.warn(
+      'cloud credentials are no longer available on self-hosted runner steps; please use step.env and secrets instead'
+    );
 
     try {
       const runnerCfg = resolve(workdir, '.runner');
@@ -263,23 +279,28 @@ class Github {
         )}.tar.gz`;
         await download({ url, path: destination });
         await tar.extract({ file: destination, cwd: workdir });
-        await exec(`chmod -R 777 ${workdir}`);
       }
 
       await exec(
-        `${resolve(
-          workdir,
-          'config.sh'
-        )} --unattended --token "${await this.runnerToken()}" --url "${
-          this.repo
-        }" --name "${name}" --labels "${labels}" --work "${resolve(
-          workdir,
-          '_work'
-        )}" ${single ? ' --ephemeral' : ''}`
+        resolve(workdir, 'config.sh'),
+        '--unattended',
+        '--token',
+        await this.runnerToken(),
+        '--url',
+        this.repo,
+        '--name',
+        name,
+        '--labels',
+        labels,
+        '--work',
+        resolve(workdir, '_work'),
+        // adds `--ephemeral` to the array only if `single` is set
+        ...(single ? ['--ephemeral'] : [])
       );
 
       return spawn(resolve(workdir, 'run.sh'), {
-        shell: true
+        shell: true,
+        env
       });
     } catch (err) {
       throw new Error(`Failed preparing GitHub runner: ${err.message}`);
@@ -288,7 +309,7 @@ class Github {
 
   async runners(opts = {}) {
     const { owner, repo } = ownerRepo({ uri: this.repo });
-    const { paginate, actions } = octokit(this.token, this.repo);
+    const { paginate, actions } = octokit(this.token, this.repo, logger);
 
     let runners;
     if (typeof repo === 'undefined') {
@@ -310,7 +331,7 @@ class Github {
   async runnerById(opts = {}) {
     const { id } = opts;
     const { owner, repo } = ownerRepo({ uri: this.repo });
-    const { actions } = octokit(this.token, this.repo);
+    const { actions } = octokit(this.token, this.repo, logger);
 
     if (typeof repo === 'undefined') {
       const { data: runner } = await actions.getSelfHostedRunnerForOrg({
@@ -328,6 +349,64 @@ class Github {
     });
 
     return this.parseRunner(runner);
+  }
+
+  async runnerJob({ runnerId, status = 'queued' } = {}) {
+    const { owner, repo } = ownerRepo({ uri: this.repo });
+    const octokitClient = octokit(this.token, this.repo, logger);
+
+    if (status === 'running') status = 'in_progress';
+
+    const workflowRuns = await octokitClient.paginate(
+      octokitClient.actions.listWorkflowRunsForRepo,
+      { owner, repo, status }
+    );
+
+    let runJobs = await Promise.all(
+      workflowRuns.map(
+        async ({ id }) =>
+          await octokitClient.paginate(
+            octokitClient.actions.listJobsForWorkflowRun,
+            { owner, repo, run_id: id, status }
+          )
+      )
+    );
+
+    runJobs = [].concat.apply([], runJobs);
+
+    for (const job of runJobs) {
+      const { id } = job;
+
+      while (!job.runner_id) {
+        const {
+          data: { runner_id: jobRunnerId }
+        } = await octokitClient.actions.getJobForWorkflowRun({
+          owner,
+          repo,
+          job_id: id
+        });
+
+        job.runner_id = jobRunnerId;
+        if (job.runner_id === runnerId) break;
+        await sleep(16);
+      }
+    }
+
+    runJobs = runJobs.map((job) => {
+      const { id, started_at: date, run_id: runId, runner_id: runnerId } = job;
+      return { id, date, runId, runnerId };
+    });
+
+    return runJobs.find((job) => runnerId === job.runnerId);
+  }
+
+  runnerLogPatterns() {
+    return {
+      ready: /Listening for Jobs/,
+      job_started: /Running job/,
+      job_ended: /completed with result/,
+      job_ended_succeded: /completed with result: Succeeded/
+    };
   }
 
   parseRunner(runner) {
@@ -387,7 +466,11 @@ class Github {
       });
       return true;
     } catch (error) {
-      if (error.message === 'Branch not protected') {
+      const errors = [
+        'Branch not protected',
+        'Upgrade to GitHub Pro or make this repository public to enable this feature.'
+      ];
+      if (errors.includes(error.message)) {
         return false;
       }
       throw error;
@@ -447,13 +530,21 @@ class Github {
 
       const settingsUrl = `https://github.com/${owner}/${repo}/settings`;
 
-      if (await this.isProtected({ branch: base })) {
-        winston.warn(
-          `Failed to enable auto-merge: Enable the feature in your repository settings: ${settingsUrl}#merge_types_auto_merge. Trying to merge immediately...`
-        );
-      } else {
-        winston.warn(
-          `Failed to enable auto-merge: Set up branch protection and add "required status checks" for branch '${base}': ${settingsUrl}/branches. Trying to merge immediately...`
+      try {
+        if (await this.isProtected({ branch: base })) {
+          logger.warn(
+            `Failed to enable auto-merge: Enable the feature in your repository settings: ${settingsUrl}#merge_types_auto_merge. Trying to merge immediately...`
+          );
+        } else {
+          logger.warn(
+            `Failed to enable auto-merge: Set up branch protection and add "required status checks" for branch '${base}': ${settingsUrl}/branches. Trying to merge immediately...`
+          );
+        }
+      } catch (err) {
+        if (!err.message.includes('Resource not accessible by integration'))
+          throw err;
+        logger.warn(
+          `Failed to enable auto-merge. Trying to merge immediately...`
         );
       }
 
@@ -466,6 +557,57 @@ class Github {
         commit_message: commitBody
       });
     }
+  }
+
+  async issueCommentCreate(opts = {}) {
+    const { issueId, report } = opts;
+    const { owner, repo } = ownerRepo({ uri: this.repo });
+    const { issues } = octokit(this.token, this.repo);
+
+    const {
+      data: { html_url: htmlUrl }
+    } = await issues.createComment({
+      owner,
+      repo,
+      body: report,
+      issue_number: issueId
+    });
+
+    return htmlUrl;
+  }
+
+  async issueCommentUpdate(opts = {}) {
+    const { id, report } = opts;
+    if (!id) throw new Error('Id is missing updating comment');
+    const { owner, repo } = ownerRepo({ uri: this.repo });
+    const { issues } = octokit(this.token, this.repo);
+
+    const {
+      data: { html_url: htmlUrl }
+    } = await issues.updateComment({
+      owner,
+      repo,
+      body: report,
+      comment_id: id
+    });
+
+    return htmlUrl;
+  }
+
+  async issueComments(opts = {}) {
+    const { issueId } = opts;
+    const { owner, repo } = ownerRepo({ uri: this.repo });
+    const { issues } = octokit(this.token, this.repo);
+
+    const { data: comments } = await issues.listComments({
+      owner,
+      repo,
+      issue_number: issueId
+    });
+
+    return comments.map(({ id, body }) => {
+      return { id, body };
+    });
   }
 
   async prCommentCreate(opts = {}) {
@@ -543,12 +685,21 @@ class Github {
     });
   }
 
-  async pipelineRerun(opts = {}) {
-    const { id = GITHUB_RUN_ID } = opts;
+  async pipelineRerun({ id = GITHUB_RUN_ID, jobId } = {}) {
     const { owner, repo } = ownerRepo({ uri: this.repo });
-    const { actions } = octokit(this.token, this.repo);
+    const { actions } = octokit(this.token, this.repo, logger);
 
-    const {
+    if (!id && jobId) {
+      ({
+        data: { run_id: id }
+      } = await actions.getJobForWorkflowRun({
+        owner,
+        repo,
+        job_id: jobId
+      }));
+    }
+
+    let {
       data: { status }
     } = await actions.getWorkflowRun({
       owner,
@@ -556,51 +707,36 @@ class Github {
       run_id: id
     });
 
-    if (status !== 'running') {
-      await actions.reRunWorkflow({
+    if (status === 'in_progress') {
+      await actions.cancelWorkflowRun({
         owner,
         repo,
         run_id: id
       });
-    }
-  }
 
-  async pipelineRestart(opts = {}) {
-    const { jobId } = opts;
-    const { owner, repo } = ownerRepo({ uri: this.repo });
-    const { actions } = octokit(this.token, this.repo);
-
-    const {
-      data: { run_id: runId }
-    } = await actions.getJobForWorkflowRun({
-      owner,
-      repo,
-      job_id: jobId
-    });
-
-    const {
-      data: { status }
-    } = await actions.getWorkflowRun({
-      owner,
-      repo,
-      run_id: runId
-    });
-
-    if (status !== 'running') {
-      try {
-        await actions.reRunWorkflow({
+      while (status === 'in_progress') {
+        ({
+          data: { status }
+        } = await actions.getWorkflowRun({
           owner,
           repo,
-          run_id: runId
-        });
-      } catch (err) {}
+          run_id: id
+        }));
+        await sleep(1);
+      }
     }
+
+    await actions.reRunWorkflow({
+      owner,
+      repo,
+      run_id: id
+    });
   }
 
   async pipelineJobs(opts = {}) {
     const { jobs: runnerJobs } = opts;
     const { owner, repo } = ownerRepo({ uri: this.repo });
-    const { actions } = octokit(this.token, this.repo);
+    const { actions } = octokit(this.token, this.repo, logger);
 
     const jobs = await Promise.all(
       runnerJobs.map(async (job) => {
@@ -620,60 +756,35 @@ class Github {
     });
   }
 
-  async job(opts = {}) {
-    const { time, runnerId } = opts;
-    const { owner, repo } = ownerRepo({ uri: this.repo });
-    const octokitClient = octokit(this.token, this.repo);
-
-    let { status = 'queued' } = opts;
-    if (status === 'running') status = 'in_progress';
-
-    const workflowRuns = await octokitClient.paginate(
-      octokitClient.actions.listWorkflowRunsForRepo,
-      { owner, repo, status }
-    );
-
-    let runJobs = await Promise.all(
-      workflowRuns.map(
-        async ({ id }) =>
-          await octokitClient.paginate(
-            octokitClient.actions.listJobsForWorkflowRun,
-            { owner, repo, run_id: id, status }
-          )
-      )
-    );
-
-    runJobs = [].concat.apply([], runJobs).map((job) => {
-      const { id, started_at: date, run_id: runId, runner_id: runnerId } = job;
-      return { id, date, runId, runnerId };
-    });
-
-    if (time) {
-      const job = runJobs.reduce((prev, curr) => {
-        const diffTime = (job) => Math.abs(new Date(job.date).getTime() - time);
-        return diffTime(curr) < diffTime(prev) ? curr : prev;
-      });
-
-      return job;
-    }
-
-    return runJobs.find((job) => runnerId === job.runnerId);
-  }
-
-  async updateGitConfig({ userName, userEmail } = {}) {
+  async updateGitConfig({ userName, userEmail, remote } = {}) {
     const repo = new URL(this.repo);
     repo.password = this.token;
     repo.username = 'token';
 
-    const command = `
-    git config --unset http.https://github.com/.extraheader;
-    git config user.name "${userName || this.userName}" &&
-    git config user.email "${userEmail || this.userEmail}" &&
-    git remote set-url origin "${repo.toString()}${
-      repo.toString().endsWith('.git') ? '' : '.git'
-    }"`;
+    return [
+      ['git', 'config', '--unset', 'http.https://github.com/.extraheader'],
+      ['git', 'config', 'user.name', userName || this.userName],
+      ['git', 'config', 'user.email', userEmail || this.userEmail],
+      [
+        'git',
+        'remote',
+        'set-url',
+        remote,
+        repo.toString() + (repo.toString().endsWith('.git') ? '' : '.git')
+      ]
+    ];
+  }
 
-    return command;
+  get workflowId() {
+    return GITHUB_WORKFLOW;
+  }
+
+  get runId() {
+    return GITHUB_RUN_ID;
+  }
+
+  warn(message) {
+    console.error(`::warning::${message}`);
   }
 
   get sha() {
@@ -681,6 +792,16 @@ class Github {
       return github.context.payload.pull_request.head.sha;
 
     return GITHUB_SHA;
+  }
+
+  /**
+   * Returns the PR number if we're in a PR-related action event.
+   */
+  get pr() {
+    if (['pull_request', 'pull_request_target'].includes(GITHUB_EVENT_NAME)) {
+      return github.context.payload.pull_request.number;
+    }
+    return null;
   }
 
   get branch() {
